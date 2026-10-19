@@ -24,7 +24,8 @@ jobs:
           set -eux
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
-            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu file
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu file \
+            libc6-dev-arm64-cross linux-libc-dev-arm64-cross
 
       - name: Comprobar que el codigo fuente esta presente
         run: |
@@ -36,8 +37,13 @@ jobs:
         run: |
           set -eux
           mkdir -p out
+          # Forzar los includes/sysroot del cross-compilador (evita que GCC tome
+          # /usr/include del host, que es x86_64 y rompe con libc-header-start.h)
+          echo "=== include search path de aarch64-linux-gnu-gcc ==="
+          echo | aarch64-linux-gnu-gcc -E -Wp,-v - 2>&1 | sed -n '/#include <...>/,/End of search/p' || true
           aarch64-linux-gnu-gcc \
             -O2 -Wall -Wextra -static \
+            --sysroot=/usr/aarch64-linux-gnu \
             -o out/qca-bringup \
             tools/qca-bringup/qca-bringup.c
           file out/qca-bringup
