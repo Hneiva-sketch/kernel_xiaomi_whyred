@@ -1,0 +1,187 @@
+name: Build aa-proxy-rs (aarch64 glibc, sin io-uring)
+
+on:
+  workflow_dispatch:
+    inputs:
+      aa_ref:
+        description: "Commit o tag fijado de manio/aa-proxy-rs"
+        required: false
+        default: "fcbd3c524af02336f9ab8785474de1aa1be2e829"
+      locked:
+        description: "'si' = --locked (reproducible). 'no' = permite actualizar Cargo.lock"
+        required: false
+        default: "si"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    steps:
+      - name: Versiones del runner y toolchains
+        run: |
+          set -eux
+          uname -a
+          lsb_release -ds || true
+          rustc -Vv || true
+          cargo -V || true
+          rustup show || true
+          aarch64-linux-gnu-gcc --version | head -n1 || true
+          {
+            echo "runner: $(lsb_release -ds 2>/dev/null || echo unknown)"
+            echo "rustc: $(rustc -V 2>/dev/null || echo unknown)"
+            echo "cargo: $(cargo -V 2>/dev/null || echo unknown)"
+            echo "cross-gcc: $(aarch64-linux-gnu-gcc --version 2>/dev/null | head -n1 || echo unknown)"
+          } > VERSIONES.txt
+
+      - name: Instalar toolchain cross (apt oficial de Ubuntu, firmado por Canonical)
+        run: |
+          set -eux
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            pkg-config cmake ninja-build perl make file python3
+
+      - name: OpenSSL arm64 desde ports.ubuntu.com (apt verifica la firma GPG de Canonical)
+        run: |
+          set -eux
+          sudo dpkg --add-architecture arm64
+          # Restringir las fuentes actuales a amd64 para que apt no busque arm64 en archive.ubuntu.com
+          if [ -f /etc/apt/sources.list ]; then
+            sudo sed -i -E 's/^(deb|deb-src) ([^[])/\1 [arch=amd64] \2/' /etc/apt/sources.list
+          fi
+          for f in /etc/apt/sources.list.d/*.sources; do
+            [ -e "$f" ] || continue
+            if ! grep -q '^Architectures:' "$f"; then
+              sudo sed -i -E 's/^Types: deb$/Types: deb\nArchitectures: amd64/' "$f"
+            fi
+          done
+          {
+            echo 'deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy main universe'
+            echo 'deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy-updates main universe'
+            echo 'deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy-security main universe'
+          } | sudo tee /etc/apt/sources.list.d/arm64-ports.list
+          sudo apt-get update -qq
+          mkdir -p "$HOME/sslarm"
+          cd "$HOME/sslarm"
+          apt-get download libssl-dev:arm64 libssl3:arm64
+          dpkg-deb -x libssl-dev_*_arm64.deb root
+          dpkg-deb -x libssl3_*_arm64.deb root
+          test -f root/usr/include/openssl/ssl.h
+          ls -l root/usr/lib/aarch64-linux-gnu/libssl.so*
+          sha256sum ./*.deb | tee SHA256_ssl.txt
+          {
+            echo "libssl-dev: $(dpkg-deb -f libssl-dev_*_arm64.deb Package) $(dpkg-deb -f libssl-dev_*_arm64.deb Version)"
+            echo "libssl3: $(dpkg-deb -f libssl3_*_arm64.deb Package) $(dpkg-deb -f libssl3_*_arm64.deb Version)"
+          } | tee -a "$GITHUB_WORKSPACE/VERSIONES.txt"
+
+      - name: Objetivo Rust aarch64 (static.rust-lang.org, oficial)
+        run: |
+          set -eux
+          rustup target add aarch64-unknown-linux-gnu
+          rustc -Vv | tee -a "$GITHUB_WORKSPACE/VERSIONES.txt"
+          cargo -V | tee -a "$GITHUB_WORKSPACE/VERSIONES.txt"
+
+      - name: Obtener fuente de aa-proxy-rs (commit fijado)
+        env:
+          AA_REF: ${{ inputs.aa_ref }}
+        run: |
+          set -eux
+          git clone https://github.com/manio/aa-proxy-rs.git aa-src
+          cd aa-src
+          git checkout --detach "$AA_REF"
+          git rev-parse HEAD | tee "$GITHUB_WORKSPACE/AA_COMMIT.txt"
+          git log -1 --format='%H%n%ad%n%s' --date=iso | tee "$GITHUB_WORKSPACE/AA_COMMIT_INFO.txt"
+          sha256sum Cargo.lock Cargo.toml | tee "$GITHUB_WORKSPACE/AA_SOURCE_SHA256.txt"
+
+      - name: Compilar (release, sin io-uring ni wasm-scripting)
+        env:
+          USE_LOCKED: ${{ inputs.locked }}
+        run: |
+          set -eux
+          export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+          export CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
+          export AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar
+          export CFLAGS_aarch64_unknown_linux_gnu="-O2 -fPIC"
+          export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+          export OPENSSL_LIB_DIR="$HOME/sslarm/root/usr/lib/aarch64-linux-gnu"
+          export OPENSSL_INCLUDE_DIR="$HOME/sslarm/root/usr/include"
+          export OPENSSL_NO_PKG_CONFIG=1
+          export PKG_CONFIG_ALLOW_CROSS=1
+          cd aa-src
+          FLAGS="--release --no-default-features --target aarch64-unknown-linux-gnu"
+          if [ "$USE_LOCKED" = "si" ]; then
+            if cargo build --locked $FLAGS; then
+              echo "modo=locked" >> "$GITHUB_WORKSPACE/AA_BUILD_MODE.txt"
+            else
+              echo "AVISO: --locked fallo; se reintenta sin --locked"
+              echo "modo=sin-locked" >> "$GITHUB_WORKSPACE/AA_BUILD_MODE.txt"
+              cargo build $FLAGS
+            fi
+          else
+            echo "modo=sin-locked" >> "$GITHUB_WORKSPACE/AA_BUILD_MODE.txt"
+            cargo build $FLAGS
+          fi
+          ls -lh target/aarch64-unknown-linux-gnu/release/aa-proxy-rs
+
+      - name: Verificar binario (GLIBC<=2.35, dependencias, sin tokio-uring)
+        run: |
+          set -eux
+          BIN="$GITHUB_WORKSPACE/aa-src/target/aarch64-unknown-linux-gnu/release/aa-proxy-rs"
+          test -f "$BIN"
+          file "$BIN" | tee "$GITHUB_WORKSPACE/BIN_INFO.txt"
+          readelf -d "$BIN" | grep -E 'NEEDED' | tee "$GITHUB_WORKSPACE/BIN_NEEDED.txt"
+          objdump -T "$BIN" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -u -V | tee "$GITHUB_WORKSPACE/BIN_GLIBC.txt"
+          MAX=$(objdump -T "$BIN" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sed 's/GLIBC_//' | sort -u -V | tail -n1)
+          echo "GLIBC maximo requerido: $MAX"
+          if ! echo "$MAX" | awk -F. '($1>2)||($1==2&&$2>35){exit 1}'; then
+            echo "ERROR: el binario requiere glibc $MAX > 2.35 (el chroot es Ubuntu 22.04 = glibc 2.35)"
+            exit 1
+          fi
+          echo "OK glibc <= 2.35"
+          if grep -qE 'libssl\.so\.' "$GITHUB_WORKSPACE/BIN_NEEDED.txt"; then
+            grep -q 'libssl.so.3' "$GITHUB_WORKSPACE/BIN_NEEDED.txt" || {
+              echo "ERROR: el binario no enlaza libssl.so.3"; exit 1; }
+          fi
+          echo "OK libssl"
+          cd "$GITHUB_WORKSPACE/aa-src"
+          if cargo tree --locked --no-default-features --target aarch64-unknown-linux-gnu -i tokio-uring >/dev/null 2>&1; then
+            echo "ERROR: la feature io-uring (tokio-uring) esta presente en el arbol de dependencias"
+            exit 1
+          fi
+          echo "OK tokio-uring ausente"
+          cd "$GITHUB_WORKSPACE"
+          sha256sum aa-src/target/aarch64-unknown-linux-gnu/release/aa-proxy-rs | tee SHA256SUMS.txt
+          ls -lh aa-src/target/aarch64-unknown-linux-gnu/release/aa-proxy-rs | tee -a BIN_INFO.txt
+          cp "$HOME/sslarm/SHA256_ssl.txt" "$GITHUB_WORKSPACE/"
+
+      - name: Staging del artefacto
+        run: |
+          set -eux
+          mkdir -p artifact
+          cp aa-src/target/aarch64-unknown-linux-gnu/release/aa-proxy-rs artifact/
+          cp SHA256SUMS.txt BIN_INFO.txt BIN_NEEDED.txt BIN_GLIBC.txt VERSIONES.txt artifact/
+          cp AA_COMMIT.txt AA_COMMIT_INFO.txt AA_SOURCE_SHA256.txt AA_BUILD_MODE.txt artifact/
+          cp SHA256_ssl.txt artifact/
+          ls -la artifact
+          {
+            echo "## aa-proxy-rs aarch64"
+            echo '```'
+            cat artifact/BIN_INFO.txt
+            echo '```'
+            echo '- SHA256:'
+            echo '```'
+            cat artifact/SHA256SUMS.txt
+            echo '```'
+            echo '- Commit fuente:'
+            echo '```'
+            cat artifact/AA_COMMIT_INFO.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Subir binario + hashes + registros
+        uses: actions/upload-artifact@v4
+        with:
+          name: aa-proxy-rs-whyred-aarch64
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 30
