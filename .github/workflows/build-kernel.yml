@@ -1,32 +1,20 @@
-name: Build Kernel whyred (HCIUART + RFCOMM)
+name: Build Kernel whyred (BT HCIUART + RFCOMM, DTB fstab)
 
-# Objetivo: construir SOLO el kernel (Image.gz-dtb) de la rama `fourteen`
-# (KCUFKernel 4.19.289) anadiendo el transporte Bluetooth HCI-UART (BT_HCIUART*)
-# y RFCOMM, que es lo unico que le falta al ROM para poder usar la BlueZ del
-# chroot sobre /dev/ttyHS0.
+# Reproduce el flujo OFICIAL del repo (build.sh):
+#   make vendor/whyred_defconfig
+#   disable CONFIG_NEWCAM_BLOBS
+#   disable CONFIG_DYNAMIC_WHYRED   <-- CLAVE: asi el Makefile de dts genera
+#                                       whyred_fstab.dtb (con nodo firmware/android/fstab)
+#                                       en vez de whyred.dtb (sin el).
+#   + BT_HCIUART / BT_HCIUART_H4 / BT_HCIUART_QCA / BT_RFCOMM / BT_RFCOMM_TTY  (lo nuestro)
+#   - CONFIG_KSU (usamos Magisk)
+#   make dtbs ; make Image
+#   Image.gz-dtb = gzip(Image) + whyred_fstab.dtb          (igual que el kernel del ROM)
 #
-# Toolchain: clang-14 / lld-14 / llvm-14 de los repositorios oficiales de
-# Ubuntu 22.04 (paquetes firmados por Canonical). El clang que usaba el autor
-# (gitlab.com/shekhawat2/clang-builds) ya no es publico.
+# Toolchain: clang-14/lld-14/llvm-14 de Ubuntu 22.04 (paquetes firmados por Canonical).
 
 on:
   workflow_dispatch:
-    inputs:
-      ksu:
-        description: "Incluir KernelSU (NO: usamos Magisk)"
-        type: choice
-        options: ["disable", "keep"]
-        default: "disable"
-      werror:
-        description: "Tratar avisos como errores (CONFIG_CC_WERROR)"
-        type: choice
-        options: ["keep", "disable"]
-        default: "keep"
-      lto:
-        description: "Compilar con LTO (CONFIG_LTO_CLANG)"
-        type: choice
-        options: ["keep", "disable"]
-        default: "keep"
 
 permissions:
   contents: read
@@ -35,6 +23,14 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: lto-on
+            lto: keep
+          - variant: lto-off
+            lto: disable
 
     steps:
       - name: Checkout fuente + submodulo KernelSU (necesario para drivers/Kconfig)
@@ -49,9 +45,10 @@ jobs:
           echo "HEAD=$(git rev-parse HEAD)"
           git log -1 --oneline
           echo "defconfig_lines=$(wc -l < arch/arm64/configs/vendor/whyred_defconfig)"
-          echo "--- symlink drivers/kernelsu ---"
           ls -l drivers/kernelsu || true
           test -f drivers/kernelsu/Kconfig && echo "OK drivers/kernelsu/Kconfig presente" || { echo "FALTA drivers/kernelsu/Kconfig"; exit 1; }
+          echo "--- lineas relevantes del Makefile de dts ---"
+          grep -nE 'whyred|DYNAMIC_WHYRED' arch/arm64/boot/dts/vendor/qcom/Makefile || true
 
       - name: Instalar dependencias (clang-14 oficial de Ubuntu)
         run: |
@@ -80,11 +77,9 @@ jobs:
         run: |
           clang --version
           ld.lld --version
-          llvm-ar --version
-          llvm-nm --version | head -n1
-          llvm-strip --version | head -n1
+          dtc --version
 
-      - name: Configurar defconfig + Bluetooth HCIUART/RFCOMM + ajustes
+      - name: Configurar defconfig (flujo oficial + Bluetooth)
         run: |
           set -e
           export ARCH=arm64
@@ -92,24 +87,23 @@ jobs:
           make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 vendor/whyred_defconfig
 
           CFG=./scripts/config
-          # --- lo que necesitamos anadir ---
+          # --- flujo oficial de build.sh ---
+          $CFG --file out/.config -d NEWCAM_BLOBS || true
+          echo "### DESACTIVANDO CONFIG_DYNAMIC_WHYRED (queremos whyred_fstab.dtb)"
+          $CFG --file out/.config -d DYNAMIC_WHYRED
+
+          # --- lo que necesitamos anadir (Bluetooth sobre UART) ---
           $CFG --file out/.config -e BT_HCIUART
           $CFG --file out/.config -e BT_HCIUART_H4
           $CFG --file out/.config -e BT_HCIUART_QCA
           $CFG --file out/.config -e BT_RFCOMM
           $CFG --file out/.config -e BT_RFCOMM_TTY
 
-          # --- KernelSU fuera: usamos Magisk, no queremos otra via de root ---
-          if [ "${{ github.event.inputs.ksu }}" = "disable" ]; then
-            echo "### desactivando CONFIG_KSU (KernelSU)"
-            $CFG --file out/.config -d KSU
-          fi
+          # --- KernelSU fuera: usamos Magisk ---
+          $CFG --file out/.config -d KSU
 
-          if [ "${{ github.event.inputs.werror }}" = "disable" ]; then
-            echo "### desactivando CONFIG_CC_WERROR"
-            $CFG --file out/.config -d CC_WERROR
-          fi
-          if [ "${{ github.event.inputs.lto }}" = "disable" ]; then
+          # --- variante del matrix ---
+          if [ "${{ matrix.lto }}" = "disable" ]; then
             echo "### desactivando CONFIG_LTO_CLANG"
             $CFG --file out/.config -d LTO_CLANG
           fi
@@ -118,7 +112,8 @@ jobs:
 
           echo "===================== VERIFICACION (obligatorios) ====================="
           for opt in BT BT_BREDR BT_HCIUART BT_HCIUART_H4 BT_HCIUART_QCA \
-                     BT_RFCOMM BT_RFCOMM_TTY USB_CONFIGFS_F_ACC USB_CONFIGFS_UEVENT; do
+                     BT_RFCOMM BT_RFCOMM_TTY USB_CONFIGFS_F_ACC USB_CONFIGFS_UEVENT \
+                     ARCH_SDM660; do
             if grep -qE "^CONFIG_${opt}=y$" out/.config; then
               echo "OK    CONFIG_${opt}=y"
             else
@@ -127,20 +122,21 @@ jobs:
               exit 1
             fi
           done
-          echo "===================== VERIFICACION (informativos) ====================="
-          for opt in BT_HCIUART_SERDEV BT_QCA BT_LE BT_HS BT_MSM_BT_POWER \
-                     BUILD_ARM64_APPENDED_DTB_IMAGE; do
-            if grep -qE "^CONFIG_${opt}=y$" out/.config; then
-              echo "OK    CONFIG_${opt}=y"
-            else
-              echo "AVISO CONFIG_${opt} NO es 'y'"
-            fi
-          done
+
+          echo "===================== DTB: tiene que ser la variante fstab ====================="
+          if grep -qE "^# CONFIG_DYNAMIC_WHYRED is not set$" out/.config; then
+            echo "OK    CONFIG_DYNAMIC_WHYRED desactivado -> el Makefile dara whyred_fstab.dtb"
+          else
+            echo "ERROR: CONFIG_DYNAMIC_WHYRED no esta desactivado:"
+            grep -E "DYNAMIC_WHYRED" out/.config || true
+            exit 1
+          fi
+
           echo "===================== flags relevantes ====================="
-          grep -E "^(CONFIG_KSU|# CONFIG_KSU|CONFIG_CC_WERROR|# CONFIG_CC_WERROR|CONFIG_LTO_CLANG|# CONFIG_LTO_CLANG|CONFIG_LOCALVERSION=|CONFIG_MODULE_SIG|CONFIG_MODULE_SIG_FORCE)" out/.config || true
+          grep -E "^(CONFIG_KSU|# CONFIG_KSU|CONFIG_CC_WERROR|# CONFIG_CC_WERROR|CONFIG_LTO_CLANG|# CONFIG_LTO_CLANG|CONFIG_LOCALVERSION=|CONFIG_MODULE_SIG|CONFIG_MODULE_SIG_FORCE|CONFIG_BUILD_ARM64_APPENDED_DTB_IMAGE|# CONFIG_DYNAMIC_WHYRED)" out/.config || true
           echo "==========================================================="
 
-      - name: Compilar kernel (Image.gz-dtb)
+      - name: Compilar Image y dtbs
         run: |
           set -e
           export ARCH=arm64
@@ -149,38 +145,72 @@ jobs:
             make -j"$(nproc)" O=out ARCH=arm64 \
               CROSS_COMPILE=aarch64-linux-gnu- \
               CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-              LLVM=1 LLVM_IAS=1
+              LLVM=1 LLVM_IAS=1 "$@"
           }
 
-          echo "########## INTENTO 1: configuracion fiel al ROM ##########"
-          rc=0
-          mkbuild || rc=$?
-
-          if [ "$rc" -ne 0 ]; then
-            echo "########## INTENTO 1 FALLO (rc=$rc) ##########"
-            echo "########## INTENTO 2: sin CC_WERROR y sin LTO_CLANG ##########"
-            ./scripts/config --file out/.config -d CC_WERROR
-            ./scripts/config --file out/.config -d LTO_CLANG
-            make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
-            grep -E "CC_WERROR|LTO_CLANG" out/.config || true
-            mkbuild
-          fi
+          echo "########## dtbs ##########"
+          mkbuild dtbs
+          echo "########## Image ##########"
+          mkbuild Image
 
           echo "---- out/arch/arm64/boot ----"
           ls -l out/arch/arm64/boot/
+          echo "---- dtbs generados ----"
+          ls -l out/arch/arm64/boot/dts/vendor/qcom/whyred* || true
 
-      - name: Verificar imagen y calcular SHA256
+      - name: Montar Image.gz-dtb (gzip(Image) + whyred_fstab.dtb) y VERIFICAR
         run: |
-          test -s out/arch/arm64/boot/Image.gz-dtb
-          ls -l out/arch/arm64/boot/Image.gz-dtb
-          sha256sum out/arch/arm64/boot/Image.gz-dtb | tee sha256.txt
+          set -e
+          DTB=out/arch/arm64/boot/dts/vendor/qcom/whyred_fstab.dtb
+          test -s "$DTB" || { echo "ERROR: no existe $DTB"; ls -l out/arch/arm64/boot/dts/vendor/qcom/ | head -50; exit 1; }
+          test -s out/arch/arm64/boot/Image
 
-      - name: Subir Image.gz-dtb
+          echo "=== el DTB DEBE llevar el nodo firmware/android/fstab ==="
+          dtc -I dtb -O dts -o /tmp/fstab.dts "$DTB"
+          grep -n -A3 'firmware/android/fstab' /tmp/fstab.dts | head -40 || { echo "ERROR: el DTB no tiene nodo fstab"; exit 1; }
+          grep -q 'by-name/system' /tmp/fstab.dts || { echo "ERROR: el DTB no referencia by-name/system"; exit 1; }
+          grep -q 'by-name/vendor' /tmp/fstab.dts || { echo "ERROR: el DTB no referencia by-name/vendor"; exit 1; }
+          echo "=== raiz (msm-id / board-id) ==="
+          grep -nE 'qcom,msm-id|qcom,board-id|compatible' /tmp/fstab.dts | head -8
+
+          echo "=== montando Image.gz-dtb ==="
+          gzip -9 -c out/arch/arm64/boot/Image > out/Image.gz
+          gzip -t out/Image.gz && echo "OK gzip valido"
+          cat out/Image.gz "$DTB" > out/Image.gz-dtb
+
+          SIZE=$(stat -c%s "$DTB")
+          echo "tamano DTB = $SIZE"
+          tail -c "$SIZE" out/Image.gz-dtb | cmp - "$DTB" && echo "OK: el DTB esta correctamente anexado al final"
+          python3 - <<'PY'
+          import struct, zlib
+          data = open('out/Image.gz-dtb','rb').read()
+          print("Image.gz-dtb:", len(data), "bytes")
+          assert data[:2] == b'\x1f\x8b', "no empieza por gzip"
+          d = zlib.decompressobj(31)
+          img = d.decompress(data) + d.flush()
+          rest = d.unused_data
+          print("  Image descomprimido:", len(img), "bytes")
+          print("  resto tras el gzip :", len(rest), "bytes, magic", rest[:4].hex())
+          assert rest[:4] == b'\xd0\x0d\xfe\xed', "el resto no es un DTB"
+          totalsize = struct.unpack('>I', rest[4:8])[0]
+          print("  totalsize del DTB  :", totalsize)
+          assert totalsize == len(rest), "el DTB no ocupa todo el resto"
+          print("  OK estructura Image.gz + dtb")
+          PY
+
+          sha256sum out/Image.gz-dtb out/Image "$DTB" out/.config | tee sha256.txt
+          cp out/.config config-real.config
+          cp out/System.map System.map.txt || true
+
+      - name: Subir artefactos
         uses: actions/upload-artifact@v4
         with:
-          name: Image.gz-dtb-whyred-hciuart
+          name: kernel-whyred-${{ matrix.variant }}
           path: |
-            out/arch/arm64/boot/Image.gz-dtb
+            out/Image.gz-dtb
+            Image.gz
             sha256.txt
+            config-real.config
+            System.map.txt
           if-no-files-found: error
           retention-days: 30
