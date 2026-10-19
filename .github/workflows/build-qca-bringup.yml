@@ -1,0 +1,67 @@
+name: Build qca-bringup (aarch64 estatico)
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout del repo (solo para tener el codigo)
+        uses: actions/checkout@v4
+        with:
+          ref: fourteen
+
+      - name: Mostrar versiones del runner
+        run: |
+          set -eux
+          uname -a
+          lsb_release -ds || true
+
+      - name: Instalar toolchain cross de Ubuntu (firmado por Canonical)
+        run: |
+          set -eux
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu file
+
+      - name: Comprobar que el codigo fuente esta presente
+        run: |
+          set -eux
+          ls -l tools/qca-bringup/qca-bringup.c
+          wc -l tools/qca-bringup/qca-bringup.c
+
+      - name: Compilar (estatico, aarch64)
+        run: |
+          set -eux
+          mkdir -p out
+          aarch64-linux-gnu-gcc \
+            -O2 -Wall -Wextra -static \
+            -o out/qca-bringup \
+            tools/qca-bringup/qca-bringup.c
+          file out/qca-bringup
+          aarch64-linux-gnu-size out/qca-bringup || true
+          sha256sum out/qca-bringup | tee out/sha256.txt
+
+      - name: Verificar que es ELF aarch64 estatico
+        run: |
+          set -eux
+          f=out/qca-bringup
+          file "$f" | tee out/file.txt
+          grep -q 'aarch64' out/file.txt
+          grep -qi 'statically linked' out/file.txt
+          # comprobar que NO pide librerias dinamicas
+          if aarch64-linux-gnu-readelf -d "$f" 2>/dev/null | grep -q NEEDED; then
+            echo "ERROR: el binario tiene dependencias dinamicas"; exit 1
+          fi
+          echo "OK: estatico, sin NEEDED"
+          # volcar los ioctls de bluetooth para dejarlo documentado
+          { aarch64-linux-gnu-objdump -d "$f" | grep -iE 'ioctl' | head -20; } > out/ioctls.txt || true
+
+      - name: Subir artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: qca-bringup-aarch64
+          path: out/
+          if-no-files-found: error
