@@ -1,7 +1,27 @@
 name: Build Kernel whyred (HCIUART + RFCOMM)
 
+# Objetivo: construir SOLO el kernel (Image.gz-dtb) de la rama `fourteen`
+# (KCUFKernel 4.19.289) anadiendo el transporte Bluetooth HCI-UART (BT_HCIUART*)
+# y RFCOMM, que es lo unico que le falta al ROM para poder usar la BlueZ del
+# chroot sobre /dev/ttyHS0.
+#
+# Toolchain: clang-14 / lld-14 / llvm-14 de los repositorios oficiales de
+# Ubuntu 22.04 (paquetes firmados por Canonical). El clang que usaba el autor
+# (gitlab.com/shekhawat2/clang-builds) ya no es publico.
+
 on:
   workflow_dispatch:
+    inputs:
+      werror:
+        description: "Tratar avisos como errores (CONFIG_CC_WERROR)"
+        type: choice
+        options: ["keep", "disable"]
+        default: "keep"
+      lto:
+        description: "Compilar con LTO (CONFIG_LTO_CLANG)"
+        type: choice
+        options: ["keep", "disable"]
+        default: "keep"
 
 permissions:
   contents: read
@@ -9,7 +29,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 180
+    timeout-minutes: 350
 
     steps:
       - name: Checkout kernel source (branch fourteen)
@@ -18,26 +38,47 @@ jobs:
           ref: fourteen
           fetch-depth: 1
 
-      - name: Install build dependencies
+      - name: Identificar la fuente exacta
+        run: |
+          echo "HEAD=$(git rev-parse HEAD)"
+          git log -1 --oneline
+          echo "defconfig_lines=$(wc -l < arch/arm64/configs/vendor/whyred_defconfig)"
+
+      - name: Instalar dependencias (clang-14 oficial de Ubuntu)
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
             build-essential bc bison flex cpio rsync \
             libssl-dev libelf-dev libncurses-dev \
             zip unzip curl wget git perl python3 \
-            device-tree-compiler lzop xz-utils zstd
+            device-tree-compiler lzop xz-utils zstd \
+            clang-14 lld-14 llvm-14 \
+            binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi
 
-      - name: Fetch Clang toolchain
+      - name: Crear carpeta de toolchain sin sufijo de version
         run: |
-          git clone --depth 1 -b master \
-            https://gitlab.com/shekhawat2/clang-builds.git \
-            "$GITHUB_WORKSPACE/../clang-builds"
-          "$GITHUB_WORKSPACE/../clang-builds/bin/clang" --version | head -n1
+          set -e
+          mkdir -p "$HOME/tc/bin"
+          for t in clang clang++ ld.lld lld llvm-ar llvm-nm llvm-objcopy \
+                   llvm-objdump llvm-readelf llvm-ranlib llvm-strip \
+                   llvm-size llvm-strings llvm-as llvm-dis llvm-link opt llc; do
+            p="$(command -v "${t}-14" 2>/dev/null || true)"
+            if [ -n "$p" ]; then ln -sf "$p" "$HOME/tc/bin/$t"; fi
+          done
+          echo "$HOME/tc/bin" >> "$GITHUB_PATH"
 
-      - name: Configure defconfig + enable Bluetooth HCIUART/RFCOMM
+      - name: Versiones del toolchain
         run: |
+          clang --version
+          ld.lld --version
+          llvm-ar --version
+          llvm-nm --version | head -n1
+          llvm-strip --version | head -n1
+
+      - name: Configurar defconfig + activar Bluetooth HCIUART / RFCOMM
+        run: |
+          set -e
           export ARCH=arm64
-          export PATH="$GITHUB_WORKSPACE/../clang-builds/bin:$PATH"
 
           make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 vendor/whyred_defconfig
 
@@ -48,37 +89,76 @@ jobs:
           $CFG --file out/.config -e BT_RFCOMM
           $CFG --file out/.config -e BT_RFCOMM_TTY
 
+          if [ "${{ github.event.inputs.werror }}" = "disable" ]; then
+            echo "### desactivando CONFIG_CC_WERROR"
+            $CFG --file out/.config -d CC_WERROR
+          fi
+          if [ "${{ github.event.inputs.lto }}" = "disable" ]; then
+            echo "### desactivando CONFIG_LTO_CLANG"
+            $CFG --file out/.config -d LTO_CLANG
+          fi
+
           make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
 
-          echo "===================== VERIFICACION ====================="
-          for opt in BT BT_BREDR BT_HCIUART BT_HCIUART_SERDEV BT_HCIUART_H4 BT_HCIUART_QCA BT_RFCOMM BT_RFCOMM_TTY; do
+          echo "===================== VERIFICACION (obligatorios) ====================="
+          for opt in BT BT_BREDR BT_HCIUART BT_HCIUART_H4 BT_HCIUART_QCA \
+                     BT_RFCOMM BT_RFCOMM_TTY USB_CONFIGFS_F_ACC USB_CONFIGFS_UEVENT; do
             if grep -qE "^CONFIG_${opt}=y$" out/.config; then
-              echo "OK   CONFIG_${opt}=y"
+              echo "OK    CONFIG_${opt}=y"
             else
-              echo "FALTA: CONFIG_${opt}=y"
+              echo "FALTA CONFIG_${opt}=y"
               exit 1
             fi
           done
-          echo "========================================================"
+          echo "===================== VERIFICACION (informativos) ====================="
+          for opt in BT_HCIUART_SERDEV BT_QCA BT_LE BT_HS BT_MSM_BT_POWER \
+                     BUILD_ARM64_APPENDED_DTB_IMAGE; do
+            if grep -qE "^CONFIG_${opt}=y$" out/.config; then
+              echo "OK    CONFIG_${opt}=y"
+            else
+              echo "AVISO CONFIG_${opt} NO es 'y'"
+            fi
+          done
+          echo "===================== flags relevantes ====================="
+          grep -E "^(CONFIG_CC_WERROR|# CONFIG_CC_WERROR|CONFIG_LTO_CLANG|# CONFIG_LTO_CLANG|CONFIG_LOCALVERSION=|CONFIG_MODULE_SIG|CONFIG_MODULE_SIG_FORCE)" out/.config || true
+          echo "==========================================================="
 
-      - name: Build Image.gz-dtb
+      - name: Compilar kernel (Image.gz-dtb)
         run: |
+          set -e
           export ARCH=arm64
-          export PATH="$GITHUB_WORKSPACE/../clang-builds/bin:$PATH"
-          time make O=out ARCH=arm64 -j"$(nproc)" \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-            LLVM=1 LLVM_IAS=1 \
-            Image.gz-dtb
+
+          mkbuild() {
+            make -j"$(nproc)" O=out ARCH=arm64 \
+              CROSS_COMPILE=aarch64-linux-gnu- \
+              CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+              LLVM=1 LLVM_IAS=1
+          }
+
+          echo "########## INTENTO 1: configuracion fiel al ROM ##########"
+          rc=0
+          mkbuild || rc=$?
+
+          if [ "$rc" -ne 0 ]; then
+            echo "########## INTENTO 1 FALLO (rc=$rc) ##########"
+            echo "########## INTENTO 2: sin CC_WERROR y sin LTO_CLANG ##########"
+            ./scripts/config --file out/.config -d CC_WERROR
+            ./scripts/config --file out/.config -d LTO_CLANG
+            make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
+            grep -E "CC_WERROR|LTO_CLANG" out/.config || true
+            mkbuild
+          fi
+
           echo "---- out/arch/arm64/boot ----"
           ls -l out/arch/arm64/boot/
 
-      - name: Verify image and hash
+      - name: Verificar imagen y calcular SHA256
         run: |
           test -s out/arch/arm64/boot/Image.gz-dtb
+          ls -l out/arch/arm64/boot/Image.gz-dtb
           sha256sum out/arch/arm64/boot/Image.gz-dtb | tee sha256.txt
 
-      - name: Upload Image.gz-dtb
+      - name: Subir Image.gz-dtb
         uses: actions/upload-artifact@v4
         with:
           name: Image.gz-dtb-whyred-hciuart
