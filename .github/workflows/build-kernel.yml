@@ -12,6 +12,11 @@ name: Build Kernel whyred (HCIUART + RFCOMM)
 on:
   workflow_dispatch:
     inputs:
+      ksu:
+        description: "Incluir KernelSU (NO: usamos Magisk)"
+        type: choice
+        options: ["disable", "keep"]
+        default: "disable"
       werror:
         description: "Tratar avisos como errores (CONFIG_CC_WERROR)"
         type: choice
@@ -32,17 +37,21 @@ jobs:
     timeout-minutes: 350
 
     steps:
-      - name: Checkout kernel source (branch fourteen)
+      - name: Checkout fuente + submodulo KernelSU (necesario para drivers/Kconfig)
         uses: actions/checkout@v4
         with:
           ref: fourteen
           fetch-depth: 1
+          submodules: recursive
 
       - name: Identificar la fuente exacta
         run: |
           echo "HEAD=$(git rev-parse HEAD)"
           git log -1 --oneline
           echo "defconfig_lines=$(wc -l < arch/arm64/configs/vendor/whyred_defconfig)"
+          echo "--- symlink drivers/kernelsu ---"
+          ls -l drivers/kernelsu || true
+          test -f drivers/kernelsu/Kconfig && echo "OK drivers/kernelsu/Kconfig presente" || { echo "FALTA drivers/kernelsu/Kconfig"; exit 1; }
 
       - name: Instalar dependencias (clang-14 oficial de Ubuntu)
         run: |
@@ -75,7 +84,7 @@ jobs:
           llvm-nm --version | head -n1
           llvm-strip --version | head -n1
 
-      - name: Configurar defconfig + activar Bluetooth HCIUART / RFCOMM
+      - name: Configurar defconfig + Bluetooth HCIUART/RFCOMM + ajustes
         run: |
           set -e
           export ARCH=arm64
@@ -83,11 +92,18 @@ jobs:
           make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 vendor/whyred_defconfig
 
           CFG=./scripts/config
+          # --- lo que necesitamos anadir ---
           $CFG --file out/.config -e BT_HCIUART
           $CFG --file out/.config -e BT_HCIUART_H4
           $CFG --file out/.config -e BT_HCIUART_QCA
           $CFG --file out/.config -e BT_RFCOMM
           $CFG --file out/.config -e BT_RFCOMM_TTY
+
+          # --- KernelSU fuera: usamos Magisk, no queremos otra via de root ---
+          if [ "${{ github.event.inputs.ksu }}" = "disable" ]; then
+            echo "### desactivando CONFIG_KSU (KernelSU)"
+            $CFG --file out/.config -d KSU
+          fi
 
           if [ "${{ github.event.inputs.werror }}" = "disable" ]; then
             echo "### desactivando CONFIG_CC_WERROR"
@@ -107,6 +123,7 @@ jobs:
               echo "OK    CONFIG_${opt}=y"
             else
               echo "FALTA CONFIG_${opt}=y"
+              grep -E "CONFIG_${opt}" out/.config || true
               exit 1
             fi
           done
@@ -120,7 +137,7 @@ jobs:
             fi
           done
           echo "===================== flags relevantes ====================="
-          grep -E "^(CONFIG_CC_WERROR|# CONFIG_CC_WERROR|CONFIG_LTO_CLANG|# CONFIG_LTO_CLANG|CONFIG_LOCALVERSION=|CONFIG_MODULE_SIG|CONFIG_MODULE_SIG_FORCE)" out/.config || true
+          grep -E "^(CONFIG_KSU|# CONFIG_KSU|CONFIG_CC_WERROR|# CONFIG_CC_WERROR|CONFIG_LTO_CLANG|# CONFIG_LTO_CLANG|CONFIG_LOCALVERSION=|CONFIG_MODULE_SIG|CONFIG_MODULE_SIG_FORCE)" out/.config || true
           echo "==========================================================="
 
       - name: Compilar kernel (Image.gz-dtb)
