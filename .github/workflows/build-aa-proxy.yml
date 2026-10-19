@@ -66,7 +66,15 @@ jobs:
           apt-get download libssl-dev:arm64 libssl3:arm64
           dpkg-deb -x libssl-dev_*_arm64.deb root
           dpkg-deb -x libssl3_*_arm64.deb root
+          # Debian/Ubuntu separan los headers multiarch: opensslconf.h vive en
+          # usr/include/aarch64-linux-gnu/openssl/ y el gcc cross no lo busca ahi.
+          if [ -d root/usr/include/aarch64-linux-gnu ]; then
+            echo "fusionando include multiarch en root/usr/include"
+            cp -rn root/usr/include/aarch64-linux-gnu/. root/usr/include/
+          fi
           test -f root/usr/include/openssl/ssl.h
+          test -f root/usr/include/openssl/opensslconf.h
+          echo "OK opensslconf.h localizado"
           ls -l root/usr/lib/aarch64-linux-gnu/libssl.so*
           sha256sum ./*.deb | tee SHA256_ssl.txt
           {
@@ -109,13 +117,17 @@ jobs:
           export PKG_CONFIG_ALLOW_CROSS=1
           cd aa-src
           FLAGS="--release --no-default-features --target aarch64-unknown-linux-gnu"
+          set -o pipefail
           if [ "$USE_LOCKED" = "si" ]; then
-            if cargo build --locked $FLAGS; then
+            if cargo build --locked $FLAGS 2>&1 | tee "$GITHUB_WORKSPACE/AA_CARGO_LOG.txt"; then
               echo "modo=locked" >> "$GITHUB_WORKSPACE/AA_BUILD_MODE.txt"
-            else
-              echo "AVISO: --locked fallo; se reintenta sin --locked"
+            elif grep -qiE 'lock file (needs to be updated|was modified)' "$GITHUB_WORKSPACE/AA_CARGO_LOG.txt"; then
+              echo "AVISO: Cargo.lock desactualizado respecto al commit; se reintenta sin --locked"
               echo "modo=sin-locked" >> "$GITHUB_WORKSPACE/AA_BUILD_MODE.txt"
-              cargo build $FLAGS
+              cargo build $FLAGS 2>&1 | tee -a "$GITHUB_WORKSPACE/AA_CARGO_LOG.txt"
+            else
+              echo "ERROR: fallo de compilacion que NO es del Cargo.lock (no se reintenta)"
+              exit 1
             fi
           else
             echo "modo=sin-locked" >> "$GITHUB_WORKSPACE/AA_BUILD_MODE.txt"
