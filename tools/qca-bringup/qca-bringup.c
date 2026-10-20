@@ -1133,18 +1133,24 @@ int main(int argc, char **argv)
         LOG("== sin ciclo de energia por /dev/btpower (--no-power-ioctl) ==");
     }
 
-    /* --- Paso 0b: pulsos de encendido UART (como el kernel) --- */
+    /* --- Paso 0b: pulsos de encendido UART (como el kernel) ---
+     *
+     * CRITICO: el kernel activa el flujo (RTS/CTS) ANTES de enviar cada pulso
+     * (qca_send_power_pulse -> hci_uart_set_flow_control(hu, true)). Si se
+     * envia con el flujo desactivado, el chip NO arranca y no responde.
+     * Verificado en dispositivo con --seq-diag (variante C). */
     if (do_power_pulse) {
         LOG("== Paso 0b: pulsos de encendido (2400 -> 115200) ==");
+        set_flow_control(fd, 1);
         if (set_baud(fd, B2400) < 0) goto fail;
-        set_flow_control(fd, 0);
         if (send_cmd_byte(fd, QCA_POWEROFF_PULSE) < 0) goto fail;
+        if (tcdrain(fd) < 0) ERR("tcdrain: %s", strerror(errno));
         usleep(200);
         if (set_baud(fd, B115200) < 0) goto fail;
         if (send_cmd_byte(fd, QCA_POWERON_PULSE) < 0) goto fail;
-        usleep(200);
-        LOG("  pulsos enviados, esperando 100 ms a que arranque el SoC");
-        usleep(100 * 1000);
+        if (tcdrain(fd) < 0) ERR("tcdrain: %s", strerror(errno));
+        LOG("  pulsos enviados, esperando 250 ms a que arranque el SoC");
+        usleep(250 * 1000);
         /* reabrir para sincronizar RTS/CTS */
         close(fd);
         usleep(50 * 1000);
