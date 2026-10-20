@@ -86,6 +86,13 @@
 
 static int g_verbose = 1;
 
+/* IBS (In-Band Sleep): por defecto DESACTIVADO.
+ * Motivo: al adjuntar n_hci con protocolo H4, el kernel no entiende IBS
+ * (hci_h4.c solo maneja ACL/SCO/EVENT) y rechazaria los bytes 0xFD con
+ * "Frame reassembly failed". Solo tiene sentido activarlo si se fuese a
+ * usar el protocolo QCA del kernel, que aqui NO es el caso. */
+static int g_enable_ibs = 0;
+
 #define LOG(fmt, ...) do { \
     if (g_verbose) { \
         struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts); \
@@ -218,15 +225,18 @@ static int send_cmd(int fd, uint16_t opcode, const uint8_t *params, uint8_t plen
 }
 
 /* Envía un byte como HCI_COMMAND_PKT: 01 01 00 <byte>  (para los power pulses) */
+/* Pulso de encendido/apagado del SoC.
+ *
+ * IMPORTANTE: se debe enviar UN SOLO BYTE CRUDO, no una trama HCI.
+ * El kernel lo hace asi (hci_qca.c, qca_send_power_pulse):
+ *     serdev_device_write_buf(hu->serdev, &cmd, sizeof(cmd));   // sizeof == 1
+ * Hay un circuito externo en el pin Tx que decodifica el pulso segun el
+ * baudrate al que se envie. Si lo envolvemos en "01 01 00 FC" el circuito
+ * NO lo reconoce y el chip no entra en modo boot. */
 static int send_cmd_byte(int fd, uint8_t byte)
 {
-    uint8_t pkt[4];
-    pkt[0] = HCI_COMMAND_PKT;
-    pkt[1] = 0x01;
-    pkt[2] = 0x00;
-    pkt[3] = byte;
-    LOG("TX power pulse 0x%02X (raw)", byte);
-    return write_all(fd, pkt, sizeof(pkt));
+    LOG("TX pulso crudo 0x%02X (%zu byte)", byte, (size_t)1);
+    return write_all(fd, &byte, 1);
 }
 
 /* ------------------------------------------------------------------ */
@@ -241,6 +251,42 @@ struct event {
     uint8_t  status;
 };
 
+/* ---- Protocolo IBS (In-Band Sleep) de Qualcomm ----------------------
+ * De hci_qca.c:
+ *   #define HCI_IBS_SLEEP_IND   0xFE
+ *   #define HCI_IBS_WAKE_IND    0xFD     <- lo que manda el chip
+ *   #define HCI_IBS_WAKE_ACK    0xFC     <- lo que debemos contestar
+ *   #define IBS_WAKE_RETRANS_TIMEOUT_MS 100
+ *
+ * Estos bytes NO son tramas H4 (los tipos H4 son 0x01..0x04), asi que hay que
+ * mirarlos aparte. Si el chip manda 0xFD y no le contestamos, reintenta cada
+ * ~100 ms indefinidamente (eso es lo que vimos: ~6.956 bytes en 65 s). */
+#define HCI_IBS_SLEEP_IND   0xFE
+#define HCI_IBS_WAKE_IND    0xFD
+#define HCI_IBS_WAKE_ACK    0xFC
+
+static int g_ibs_acks = 0;
+
+/* Contesta al chip. Devuelve 1 si era un byte IBS y ya se ha gestionado. */
+static int handle_ibs(int fd, uint8_t b)
+{
+    if (b == HCI_IBS_WAKE_IND) {
+        uint8_t ack = HCI_IBS_WAKE_ACK;
+        if (g_ibs_acks < 20)
+            LOG("  IBS: WAKE_IND (0xFD) -> contesto WAKE_ACK (0xFC)");
+        else if (g_ibs_acks == 20)
+            LOG("  IBS: (mas WAKE_IND; sigo contestando sin imprimir)");
+        write_all(fd, &ack, 1);
+        g_ibs_acks++;
+        return 1;
+    }
+    if (b == HCI_IBS_SLEEP_IND) {
+        if (g_verbose) LOG("  IBS: SLEEP_IND (0xFE)");
+        return 1;
+    }
+    return 0;
+}
+
 static int recv_event(int fd, struct event *ev, int timeout_ms)
 {
     uint8_t hdr[2];
@@ -250,6 +296,8 @@ static int recv_event(int fd, struct event *ev, int timeout_ms)
     for (;;) {
         if (read_exact(fd, hdr, 1, timeout_ms) < 0) return -1;
         if (hdr[0] == HCI_EVENT_PKT) break;
+        /* IBS: gestionar antes de descartar */
+        if (handle_ibs(fd, hdr[0])) continue;
         LOG("  (descartado byte 0x%02X en espera de evento)", hdr[0]);
     }
     if (read_exact(fd, hdr, 1, timeout_ms) < 0) return -1;
@@ -507,9 +555,19 @@ static int qca_download_firmware(int fd, const char *path, int is_nvm,
 
             if (tag_id == EDL_TAG_ID_HCI) {
                 if (tag_len < 3) { ERR("tag HCI corto"); goto out; }
-                fw[ao + 12 + 0] |= 0x80;        /* inband sleep */
+                /* El bit 0x80 de data[0] habilita el IBS (In-Band Sleep).
+                 * Solo lo activamos si el usuario lo pide con --ibs.
+                 * Con H4 (lo normal aqui) hay que dejarlo APAGADO, porque
+                 * hci_h4.c NO entiende IBS y rechazaria los bytes 0xFD. */
+                if (g_enable_ibs) {
+                    fw[ao + 12 + 0] |= 0x80;
+                    LOG("  NVM tag %u (HCI): IBS ACTIVADO (inband sleep)", tag_id);
+                } else {
+                    LOG("  NVM tag %u (HCI): IBS desactivado (data[0]=0x%02X)",
+                        tag_id, fw[ao + 12 + 0]);
+                }
                 fw[ao + 12 + 2] = user_baud;    /* cherokee < WCN3991 -> [2] */
-                LOG("  NVM tag %u (HCI): inband sleep + baud indice %u",
+                LOG("  NVM tag %u (HCI): baud indice %u en data[2]",
                     tag_id, user_baud);
             } else if (tag_id == EDL_TAG_ID_DEEP_SLEEP) {
                 if (tag_len < 1) { ERR("tag DEEP_SLEEP corto"); goto out; }
@@ -614,6 +672,7 @@ static void usage(const char *argv0)
         "  -f, --firmware <dir>  directorio de firmware (def: /vendor/bt_firmware/image)\n"
         "  -b, --baud <n>        baudrate final: 115200|921600|2000000|3000000 (def: 115200)\n"
         "  -p, --no-power-pulse  no enviar los pulsos de encendido\n"
+        "      --ibs             activar In-Band Sleep en el NVM (NO con H4)\n"
         "  -n, --no-attach       no adjuntar n_hci al final (solo descargar firmware)\n"
         "  -q, --quiet           menos salida\n"
         "  -v, --verbose         más salida\n"
@@ -648,6 +707,8 @@ int main(int argc, char **argv)
             final_baud = atoi(argv[i]);
         } else if (!strcmp(argv[i], "-p") || !strcmp(argv[i], "--no-power-pulse")) {
             do_power_pulse = 0;
+        } else if (!strcmp(argv[i], "--ibs")) {
+            g_enable_ibs = 1;
         } else if (!strcmp(argv[i], "-n") || !strcmp(argv[i], "--no-attach")) {
             do_attach = 0;
         } else if (!strcmp(argv[i], "-q") || !strcmp(argv[i], "--quiet")) {
