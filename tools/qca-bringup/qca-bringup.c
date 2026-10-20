@@ -659,14 +659,20 @@ static int qca_download_firmware(int fd, const char *path, int is_nvm,
             if (tag_id == EDL_TAG_ID_HCI) {
                 if (tag_len < 3) { ERR("tag HCI corto"); goto out; }
                 /* El bit 0x80 de data[0] habilita el IBS (In-Band Sleep).
-                 * Solo lo activamos si el usuario lo pide con --ibs.
-                 * Con H4 (lo normal aqui) hay que dejarlo APAGADO, porque
-                 * hci_h4.c NO entiende IBS y rechazaria los bytes 0xFD. */
+                 *
+                 * El NVM DE FABRICA de este chip YA trae ese bit puesto
+                 * (data[0]=0x82), por eso el chip manda 0xFD nada mas
+                 * arrancar H4 y hci_h4.c lo rechaza ("Frame reassembly
+                 * failed"). Con H4 hay que LIMPIARLO explicitamente.
+                 * El kernel usa HCI_UART_QCA, que si entiende IBS, y por eso
+                 * el lo pone (data[0] |= 0x80); nosotros hacemos lo contrario. */
                 if (g_enable_ibs) {
                     fw[ao + 12 + 0] |= 0x80;
-                    LOG("  NVM tag %u (HCI): IBS ACTIVADO (inband sleep)", tag_id);
+                    LOG("  NVM tag %u (HCI): IBS ACTIVADO (data[0]=0x%02X)",
+                        tag_id, fw[ao + 12 + 0]);
                 } else {
-                    LOG("  NVM tag %u (HCI): IBS desactivado (data[0]=0x%02X)",
+                    fw[ao + 12 + 0] &= (uint8_t)~0x80;
+                    LOG("  NVM tag %u (HCI): IBS DESACTIVADO (data[0]=0x%02X)",
                         tag_id, fw[ao + 12 + 0]);
                 }
                 fw[ao + 12 + 2] = user_baud;    /* cherokee < WCN3991 -> [2] */
@@ -674,8 +680,15 @@ static int qca_download_firmware(int fd, const char *path, int is_nvm,
                     tag_id, user_baud);
             } else if (tag_id == EDL_TAG_ID_DEEP_SLEEP) {
                 if (tag_len < 1) { ERR("tag DEEP_SLEEP corto"); goto out; }
-                fw[ao + 12 + 0] |= 0x01;
-                LOG("  NVM tag %u (DEEP_SLEEP)", tag_id);
+                /* Igual: el deep sleep tambien genera IBS. Sin IBS hay que
+                 * quitar el bit; el kernel lo pone (data[0] |= 0x01). */
+                if (g_enable_ibs) {
+                    fw[ao + 12 + 0] |= 0x01;
+                } else {
+                    fw[ao + 12 + 0] &= (uint8_t)~0x01;
+                }
+                LOG("  NVM tag %u (DEEP_SLEEP): data[0]=0x%02X",
+                    tag_id, fw[ao + 12 + 0]);
             }
 
             idx += 12 + tag_len;
