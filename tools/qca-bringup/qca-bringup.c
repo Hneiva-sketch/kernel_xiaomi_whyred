@@ -47,6 +47,24 @@
 #define QCA_POWERON_PULSE           0xFC
 #define QCA_POWEROFF_PULSE          0xC0
 
+/* ---------------- /dev/btpower (drivers/bluetooth/bluetooth-power.c) ----------------
+ *
+ * El HAL de Android NO enciende el chip con pulsos UART: abre /dev/btpower
+ * (misc 504:0) y manda ioctls. El "power on" enciende reguladores Y hace
+ * GPIO reset (bt_configure_gpios), que es lo que de verdad rearma el QCA.
+ * Sin ese reset, los pulsos UART no sacan al chip de su estado.
+ *
+ * Comandos (include/linux/bluetooth-power.h):
+ *   BT_CMD_PWR_CTRL      0xbfad   arg: 1=on, 0=off, 2=retention
+ *   BT_CMD_CHIPSET_VERS  0xbfae   arg: soc_version (u32)
+ *   BT_CMD_GETVAL_POWER_SRCS 0xbfb1  arg: puntero a int[28]
+ */
+#define BT_CMD_PWR_CTRL             0xbfad
+#define BT_CMD_CHIPSET_VERS         0xbfae
+#define BT_CMD_GETVAL_POWER_SRCS    0xbfb1
+#define BT_POWER_SRC_SIZE           28
+#define BT_POWER_DEV                "/dev/btpower"
+
 /* ---------------- Line discipline / ioctls ---------------- */
 /* De include/uapi/linux/tty.h y drivers/bluetooth/hci_uart.h */
 #define N_HCI                       15
@@ -115,6 +133,86 @@ static void hexdump(const char *tag, const uint8_t *d, size_t n)
         fprintf(stderr, " %02x", d[i]);
     if (n > 64) fprintf(stderr, " ...");
     fprintf(stderr, "\n");
+}
+
+/* ------------------------------------------------------------------ */
+/* Control de energia por /dev/btpower (ioctl)                        */
+/* ------------------------------------------------------------------ */
+
+/* Enciende/apaga el chip igual que el HAL propietario.
+ * on=1 -> reguladores + GPIO reset; on=0 -> apagado. */
+static int btpower_pwr(int on)
+{
+    int fd = open(BT_POWER_DEV, O_RDWR);
+    if (fd < 0) {
+        ERR("no puedo abrir %s: %s", BT_POWER_DEV, strerror(errno));
+        ERR("  ¿existe el nodo? (misc 504:0). Sin él no hay control de energia.");
+        return -1;
+    }
+    long arg = on;
+    if (ioctl(fd, BT_CMD_PWR_CTRL, arg) < 0) {
+        ERR("ioctl BT_CMD_PWR_CTRL(%d): %s", on, strerror(errno));
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    LOG("  btpower: PWR_CTRL(%d) OK", on);
+    return 0;
+}
+
+/* Informa al driver de la version del SoC (como hace el HAL).
+ * Si el driver la reconoce, puede apagar el regulador ASD. */
+static int btpower_set_version(uint32_t soc_version)
+{
+    int fd = open(BT_POWER_DEV, O_RDWR);
+    if (fd < 0) return -1;
+    if (ioctl(fd, BT_CMD_CHIPSET_VERS, (long)soc_version) < 0) {
+        ERR("ioctl BT_CMD_CHIPSET_VERS(%#x): %s", soc_version, strerror(errno));
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    LOG("  btpower: CHIPSET_VERS(%#x) OK", soc_version);
+    return 0;
+}
+
+/* Vuelca el estado de las fuentes de alimentacion (28 enteros).
+ * Los indices estan en bluetooth-power.c (enum pwr_src_index). */
+static const char *pwr_src_name(int i)
+{
+    static const char *n[BT_POWER_SRC_SIZE] = {
+        "BT_RESET_GPIO", "BT_SW_CTRL_GPIO", "BT_VDD_IO_LDO",
+        "BT_VDD_XTAL_LDO", "BT_VDD_CORE_LDO", "BT_VDD_PA_LDO",
+        "BT_VDD_LDO", "BT_VDD_AON_LDO", "BT_VDD_DIG_LDO",
+        "BT_VDD_RFA1_LDO", "BT_VDD_RFA2_LDO", "BT_VDD_ASD_LDO",
+        "BT_CHIP_PWD",
+        "BT_RESET_GPIO_CURRENT", "BT_SW_CTRL_GPIO_CURRENT",
+        "BT_VDD_IO_LDO_CURRENT", "BT_VDD_XTAL_LDO_CURRENT",
+        "BT_VDD_CORE_LDO_CURRENT", "BT_VDD_PA_LDO_CURRENT",
+        "BT_VDD_LDO_CURRENT", "BT_VDD_AON_LDO_CURRENT",
+        "BT_VDD_DIG_LDO_CURRENT", "BT_VDD_RFA1_LDO_CURRENT",
+        "BT_VDD_RFA2_LDO_CURRENT", "BT_VDD_ASD_LDO_CURRENT",
+        "BT_CHIP_PWD_CURRENT", "BT_CHIP_CLK", "BT_CHIP_CLK_CURRENT"
+    };
+    return (i >= 0 && i < BT_POWER_SRC_SIZE) ? n[i] : "?";
+}
+
+static int btpower_dump(void)
+{
+    int fd = open(BT_POWER_DEV, O_RDWR);
+    if (fd < 0) { ERR("btpower: %s", strerror(errno)); return -1; }
+    int st[BT_POWER_SRC_SIZE];
+    memset(st, 0, sizeof(st));
+    if (ioctl(fd, BT_CMD_GETVAL_POWER_SRCS, (long)st) < 0) {
+        ERR("ioctl GETVAL_POWER_SRCS: %s", strerror(errno));
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    LOG("  btpower: estado de fuentes (0/1 = GPIO, mV = regulador):");
+    for (int i = 0; i < BT_POWER_SRC_SIZE; i++)
+        LOG("    %-24s = %d", pwr_src_name(i), st[i]);
+    return 0;
 }
 
 static int open_serial(const char *dev)
@@ -802,7 +900,10 @@ static void usage(const char *argv0)
         "  -f, --firmware <dir>  directorio de firmware (def: /vendor/bt_firmware/image)\n"
         "  -b, --baud <n>        baudrate final: 115200|921600|2000000|3000000 (def: 115200)\n"
         "  -p, --no-power-pulse  no enviar los pulsos de encendido\n"
+        "      --no-power-ioctl  no usar /dev/btpower (ciclo de energia+reset)\n"
         "      --ibs             activar In-Band Sleep en el NVM (NO con H4)\n"
+        "      --btpower         consultar /dev/btpower y salir\n"
+        "      --btpower-cycle   apagar+encender por /dev/btpower y salir\n"
         "      --probe [ms]      sonda: pulsos + volcar lo que llegue (def 3000)\n"
         "      --probe-nopulse [ms]  sonda sin pulsos\n"
         "  -n, --no-attach       no adjuntar n_hci al final (solo descargar firmware)\n"
@@ -818,6 +919,7 @@ int main(int argc, char **argv)
     const char *fwdir = "/vendor/bt_firmware/image";
     int final_baud = 115200;
     int do_power_pulse = 1;
+    int do_power_ioctl = 1;
     int do_attach = 1;
 
     static const struct { int baud; uint8_t val; } baud_tbl[] = {
@@ -839,6 +941,12 @@ int main(int argc, char **argv)
             final_baud = atoi(argv[i]);
         } else if (!strcmp(argv[i], "-p") || !strcmp(argv[i], "--no-power-pulse")) {
             do_power_pulse = 0;
+        } else if (!strcmp(argv[i], "--no-power-ioctl")) {
+            do_power_ioctl = 0;
+        } else if (!strcmp(argv[i], "--btpower")) {
+            g_probe = 4;
+        } else if (!strcmp(argv[i], "--btpower-cycle")) {
+            g_probe = 5;
         } else if (!strcmp(argv[i], "--ibs")) {
             g_enable_ibs = 1;
         } else if (!strcmp(argv[i], "--probe")) {
@@ -874,15 +982,51 @@ int main(int argc, char **argv)
     /* --- Modo sonda: solo mirar que llega del chip --- */
     if (g_probe == 3)
         return pulse_test(dev);
+    if (g_probe == 4) {
+        LOG("== modo --btpower: solo consultar /dev/btpower ==");
+        return btpower_dump() < 0 ? 1 : 0;
+    }
+    if (g_probe == 5) {
+        LOG("== modo --btpower-cycle: apagar y encender el chip ==");
+        if (btpower_pwr(0) < 0) return 1;
+        usleep(200 * 1000);
+        if (btpower_pwr(1) < 0) return 1;
+        usleep(200 * 1000);
+        return btpower_dump() < 0 ? 1 : 0;
+    }
     if (g_probe)
         return probe_mode(dev, g_probe == 1, g_probe_ms > 0 ? g_probe_ms : 3000);
 
     int fd = open_serial(dev);
     if (fd < 0) return 1;
 
-    /* --- Opcional: pulsos de encendido --- */
+    /* --- Paso 0a: ciclo de energia real por /dev/btpower ---
+     *
+     * Esto es lo que hace el HAL propietario y lo que faltaba: BT_CMD_PWR_CTRL
+     * apaga/enciende los reguladores Y hace GPIO reset del chip. Los pulsos
+     * UART por si solos NO rearman el QCA. Secuencia:
+     *   PWR_CTRL(0) -> apagar del todo
+     *   PWR_CTRL(1) -> encender (reguladores + reset GPIO)
+     */
+    if (do_power_ioctl) {
+        LOG("== Paso 0a: ciclo de energia por /dev/btpower ==");
+        if (btpower_pwr(0) < 0)
+            LOG("  (no se pudo apagar; sigo igualmente)");
+        usleep(100 * 1000);
+        if (btpower_pwr(1) < 0) {
+            ERR("no se pudo encender por /dev/btpower");
+            ERR("  ¿está el HAL parado y liberado el chip?");
+            goto fail;
+        }
+        usleep(150 * 1000);   /* dejar asentar los reguladores */
+        if (g_verbose >= 2) btpower_dump();
+    } else {
+        LOG("== sin ciclo de energia por /dev/btpower (--no-power-ioctl) ==");
+    }
+
+    /* --- Paso 0b: pulsos de encendido UART (como el kernel) --- */
     if (do_power_pulse) {
-        LOG("== Paso 0: pulsos de encendido (2400 -> 115200) ==");
+        LOG("== Paso 0b: pulsos de encendido (2400 -> 115200) ==");
         if (set_baud(fd, B2400) < 0) goto fail;
         set_flow_control(fd, 0);
         if (send_cmd_byte(fd, QCA_POWEROFF_PULSE) < 0) goto fail;
@@ -912,6 +1056,9 @@ int main(int argc, char **argv)
         ERR("  ¿está el chip encendido? ¿el puerto lo tiene otro proceso?");
         goto fail;
     }
+
+    /* Informar al driver de energia de la version, como hace el HAL */
+    btpower_set_version((uint32_t)soc_version);
 
     /* --- rom_ver -> nombres de fichero --- */
     uint8_t rom_ver = (uint8_t)(((soc_version & 0x00000F00) >> 4)
