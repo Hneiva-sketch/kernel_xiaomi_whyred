@@ -823,6 +823,110 @@ static int pulse_test(const char *dev)
 }
 
 /* ------------------------------------------------------------------ */
+/* Diagnostico de secuencia: ciclo de energia + variantes de pulso      */
+/* ------------------------------------------------------------------ */
+
+static int listen_ms(int fd, int ms)
+{
+    uint8_t buf[256];
+    long total = 0;
+    struct timespec s, n;
+    clock_gettime(CLOCK_MONOTONIC, &s);
+    for (;;) {
+        clock_gettime(CLOCK_MONOTONIC, &n);
+        long el = (n.tv_sec - s.tv_sec) * 1000 + (n.tv_nsec - s.tv_nsec) / 1000000;
+        if (el >= ms) break;
+        ssize_t r = read(fd, buf, sizeof(buf));
+        if (r > 0) {
+            total += r;
+            fprintf(stderr, "    [%5ld ms] %zd B:", el, r);
+            for (ssize_t i = 0; i < r && i < 16; i++) fprintf(stderr, " %02x", buf[i]);
+            if (r > 16) fprintf(stderr, " ...");
+            fprintf(stderr, "\n");
+        } else usleep(5000);
+    }
+    return (int)total;
+}
+
+static int seq_diag(const char *dev)
+{
+    struct { const char *name; int baud; uint8_t bytes[3]; int nbytes; } variants[] = {
+        { "A: nada (solo ciclo energia)",        0,       {0},        0 },
+        { "B: 0xFC @115200",                     B115200, {0xFC},     1 },
+        { "C: 0xC0@2400 -> 0xFC@115200",         -1,      {0xC0,0xFC},2 },
+        { "D: 0xFC@2400 -> 0xFC@115200",         -2,      {0xFC,0xFC},2 },
+    };
+
+    for (size_t k = 0; k < sizeof(variants)/sizeof(variants[0]); k++) {
+        LOG("");
+        LOG("######## variante %s ########", variants[k].name);
+
+        /* ciclo de energia */
+        if (btpower_pwr(0) == 0) usleep(120 * 1000);
+        if (btpower_pwr(1) < 0) { ERR("no se pudo encender"); return 1; }
+        usleep(200 * 1000);
+
+        int fd = open_serial(dev);
+        if (fd < 0) return 1;
+
+        if (variants[k].nbytes > 0) {
+            set_flow_control(fd, 1);
+            if (variants[k].baud == -1) {
+                set_baud(fd, B2400);
+                write_all(fd, &variants[k].bytes[0], 1); tcdrain(fd);
+                usleep(200);
+                set_baud(fd, B115200);
+                write_all(fd, &variants[k].bytes[1], 1); tcdrain(fd);
+            } else if (variants[k].baud == -2) {
+                set_baud(fd, B2400);
+                write_all(fd, &variants[k].bytes[0], 1); tcdrain(fd);
+                usleep(200);
+                set_baud(fd, B115200);
+                write_all(fd, &variants[k].bytes[1], 1); tcdrain(fd);
+            } else {
+                set_baud(fd, variants[k].baud);
+                write_all(fd, variants[k].bytes, variants[k].nbytes);
+                tcdrain(fd);
+            }
+            usleep(120 * 1000);
+        } else {
+            set_baud(fd, B115200);
+            set_flow_control(fd, 1);
+            usleep(200 * 1000);
+        }
+
+        LOG("  escuchando 1500 ms...");
+        int tot = listen_ms(fd, 1500);
+
+        /* probar tambien la peticion de version a ver si responde */
+        if (tot == 0) {
+            LOG("  sin datos; probando peticion de version:");
+            struct timespec s, n; uint8_t b;
+            uint8_t cmd[] = { 0x01, 0x03, 0x00, 0x00, 0xFC, 0x19 };
+            write_all(fd, cmd, sizeof(cmd));
+            tcdrain(fd);
+            long got = 0;
+            clock_gettime(CLOCK_MONOTONIC, &s);
+            for (;;) {
+                clock_gettime(CLOCK_MONOTONIC, &n);
+                long el = (n.tv_sec-s.tv_sec)*1000+(n.tv_nsec-s.tv_nsec)/1000000;
+                if (el >= 1500) break;
+                ssize_t r = read(fd, &b, 1);
+                if (r == 1) { got++;
+                    fprintf(stderr, "    [%5ld ms] byte %02x\n", el, b); }
+                else usleep(3000);
+            }
+            LOG("  respuesta a version: %ld bytes", got);
+        }
+        close(fd);
+        usleep(300 * 1000);
+    }
+    LOG("");
+    LOG("=== fin del diagnostico de secuencia ===");
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /* Modo sonda: volcar todo lo que llega del puerto                      */
 /* ------------------------------------------------------------------ */
 
@@ -904,6 +1008,7 @@ static void usage(const char *argv0)
         "      --ibs             activar In-Band Sleep en el NVM (NO con H4)\n"
         "      --btpower         consultar /dev/btpower y salir\n"
         "      --btpower-cycle   apagar+encender por /dev/btpower y salir\n"
+        "      --seq-diag        diagnostico: ciclo energia + variantes de pulso\n"
         "      --probe [ms]      sonda: pulsos + volcar lo que llegue (def 3000)\n"
         "      --probe-nopulse [ms]  sonda sin pulsos\n"
         "  -n, --no-attach       no adjuntar n_hci al final (solo descargar firmware)\n"
@@ -957,6 +1062,8 @@ int main(int argc, char **argv)
             if (i + 1 < argc && argv[i+1][0] != '-') g_probe_ms = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--pulse-test")) {
             g_probe = 3;
+        } else if (!strcmp(argv[i], "--seq-diag")) {
+            g_probe = 6;
         } else if (!strcmp(argv[i], "-n") || !strcmp(argv[i], "--no-attach")) {
             do_attach = 0;
         } else if (!strcmp(argv[i], "-q") || !strcmp(argv[i], "--quiet")) {
@@ -994,6 +1101,8 @@ int main(int argc, char **argv)
         usleep(200 * 1000);
         return btpower_dump() < 0 ? 1 : 0;
     }
+    if (g_probe == 6)
+        return seq_diag(dev);
     if (g_probe)
         return probe_mode(dev, g_probe == 1, g_probe_ms > 0 ? g_probe_ms : 3000);
 
