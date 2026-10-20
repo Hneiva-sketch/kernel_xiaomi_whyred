@@ -315,11 +315,12 @@ static int send_cmd(int fd, uint16_t opcode, const uint8_t *params, uint8_t plen
 {
     uint8_t pkt[3 + 2 + 256];
     size_t n = 0;
+    /* Trama HCI Command (Core spec): 01 <opcode_lo> <opcode_hi> <plen> <params>
+     * NO existe campo de longitud antes del opcode. */
     pkt[n++] = HCI_COMMAND_PKT;
-    pkt[n++] = plen + 2;
-    pkt[n++] = 0x00;
     pkt[n++] = opcode & 0xFF;
     pkt[n++] = (opcode >> 8) & 0xFF;
+    pkt[n++] = plen;
     if (plen && params) { memcpy(pkt + n, params, plen); n += plen; }
     LOG("TX cmd opcode=0x%04X len=%u", opcode, plen);
     if (g_verbose > 1) hexdump("TX", pkt, n);
