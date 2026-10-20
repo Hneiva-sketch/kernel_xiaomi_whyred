@@ -93,6 +93,10 @@ static int g_verbose = 1;
  * usar el protocolo QCA del kernel, que aqui NO es el caso. */
 static int g_enable_ibs = 0;
 
+/* Modo sonda: 0 = normal, 1 = sonda con pulsos, 2 = sonda sin pulsos */
+static int g_probe = 0;
+static int g_probe_ms = 0;
+
 #define LOG(fmt, ...) do { \
     if (g_verbose) { \
         struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts); \
@@ -661,6 +665,72 @@ static int attach_h4(int fd)
 }
 
 /* ------------------------------------------------------------------ */
+/* Modo sonda: volcar todo lo que llega del puerto                      */
+/* ------------------------------------------------------------------ */
+
+/* Abre el puerto, opcionalmente envia los pulsos, y vuelca durante N ms
+ * TODO lo que reciba, byte a byte, sin interpretar nada. Sirve para saber
+ * en que estado esta realmente el chip. */
+static int probe_mode(const char *dev, int do_pulse, int ms)
+{
+    int fd = open_serial(dev);
+    if (fd < 0) return 1;
+
+    if (do_pulse) {
+        LOG("-- sonda: enviando pulsos (2400 -> 115200) --");
+        if (set_baud(fd, B2400) < 0) { close(fd); return 1; }
+        set_flow_control(fd, 0);
+        send_cmd_byte(fd, QCA_POWEROFF_PULSE);
+        usleep(200);
+        if (set_baud(fd, B115200) < 0) { close(fd); return 1; }
+        send_cmd_byte(fd, QCA_POWERON_PULSE);
+        usleep(200);
+        LOG("-- sonda: pulsos enviados, 100 ms de espera --");
+        usleep(100 * 1000);
+        close(fd);
+        usleep(50 * 1000);
+        fd = open_serial(dev);
+        if (fd < 0) return 1;
+    }
+
+    if (set_baud(fd, B115200) < 0) { close(fd); return 1; }
+    set_flow_control(fd, 1);
+
+    LOG("-- sonda: escuchando %d ms --", ms);
+    uint8_t buf[512];
+    long total = 0;
+    int empty = 0;
+
+    struct timespec start, now;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (;;) {
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long el = (now.tv_sec - start.tv_sec) * 1000
+                + (now.tv_nsec - start.tv_nsec) / 1000000;
+        if (el >= ms) break;
+
+        ssize_t n = read(fd, buf, sizeof(buf));
+        if (n > 0) {
+            total += n;
+            fprintf(stderr, "  [%6ld ms] %zd bytes:", el, n);
+            for (ssize_t i = 0; i < n && i < 32; i++)
+                fprintf(stderr, " %02x", buf[i]);
+            if (n > 32) fprintf(stderr, " ...");
+            fprintf(stderr, "\n");
+            empty = 0;
+        } else {
+            empty++;
+            usleep(5000);
+        }
+    }
+    LOG("-- sonda: total %ld bytes recibidos --", total);
+    if (total == 0)
+        LOG("-- sonda: NADA llego del chip --");
+    close(fd);
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /* main                                                                */
 /* ------------------------------------------------------------------ */
 
@@ -673,6 +743,8 @@ static void usage(const char *argv0)
         "  -b, --baud <n>        baudrate final: 115200|921600|2000000|3000000 (def: 115200)\n"
         "  -p, --no-power-pulse  no enviar los pulsos de encendido\n"
         "      --ibs             activar In-Band Sleep en el NVM (NO con H4)\n"
+        "      --probe [ms]      sonda: pulsos + volcar lo que llegue (def 3000)\n"
+        "      --probe-nopulse [ms]  sonda sin pulsos\n"
         "  -n, --no-attach       no adjuntar n_hci al final (solo descargar firmware)\n"
         "  -q, --quiet           menos salida\n"
         "  -v, --verbose         más salida\n"
@@ -709,6 +781,12 @@ int main(int argc, char **argv)
             do_power_pulse = 0;
         } else if (!strcmp(argv[i], "--ibs")) {
             g_enable_ibs = 1;
+        } else if (!strcmp(argv[i], "--probe")) {
+            g_probe = 1;
+            if (i + 1 < argc && argv[i+1][0] != '-') g_probe_ms = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--probe-nopulse")) {
+            g_probe = 2;
+            if (i + 1 < argc && argv[i+1][0] != '-') g_probe_ms = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "-n") || !strcmp(argv[i], "--no-attach")) {
             do_attach = 0;
         } else if (!strcmp(argv[i], "-q") || !strcmp(argv[i], "--quiet")) {
@@ -730,6 +808,10 @@ int main(int argc, char **argv)
         if (baud_tbl[i].baud == final_baud) final_val = baud_tbl[i].val;
 
     LOG("qca-bringup: dev=%s fw=%s baud_final=%d", dev, fwdir, final_baud);
+
+    /* --- Modo sonda: solo mirar que llega del chip --- */
+    if (g_probe)
+        return probe_mode(dev, g_probe == 1, g_probe_ms > 0 ? g_probe_ms : 3000);
 
     int fd = open_serial(dev);
     if (fd < 0) return 1;
