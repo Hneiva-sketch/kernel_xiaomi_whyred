@@ -136,6 +136,54 @@ jobs:
           grep -E "^(CONFIG_KSU|# CONFIG_KSU|CONFIG_CC_WERROR|# CONFIG_CC_WERROR|CONFIG_LTO_CLANG|# CONFIG_LTO_CLANG|CONFIG_LOCALVERSION=|CONFIG_MODULE_SIG|CONFIG_MODULE_SIG_FORCE|CONFIG_BUILD_ARM64_APPENDED_DTB_IMAGE|# CONFIG_DYNAMIC_WHYRED)" out/.config || true
           echo "==========================================================="
 
+      - name: PARCHE DTSI - forzar dr_mode = peripheral en dwc3 (whyred)
+        run: |
+          set -e
+          F=arch/arm64/boot/dts/vendor/qcom/whyred/whyred.dtsi
+          test -f "$F" || { echo "ERROR: no existe $F"; exit 1; }
+
+          echo "===================== ANTES ====================="
+          sed -n '/^&usb3 {/,/^};/p' "$F"
+
+          # El bloque de whyred.dtsi es:
+          #   &usb3 {
+          #       extcon = <&pm660_charger>;
+          #       vbus_dwc3-supply = <&smb2_vbus>;
+          #
+          #       dwc3@a800000 {
+          #           usb-phy = <&qusb_phy0>, <&usb_nop_phy>;
+          #           maximum-speed = "high-speed";
+          #       };
+          #
+          # Insertamos dr_mode = "peripheral"; dentro de dwc3@a800000 para
+          # sobrescribir el dr_mode = "otg" heredado de sdm660-common.dtsi.
+          # Comprobacion previa: no debe existir ya un dr_mode en el override.
+          if sed -n '/^&usb3 {/,/^};/p' "$F" | grep -q 'dr_mode'; then
+            echo "AVISO: ya habia dr_mode en el override; se reemplaza"
+            sed -i '/^&usb3 {/,/^};/ s/dr_mode = "[a-z]*";/dr_mode = "peripheral";/' "$F"
+          else
+            # Anade dr_mode justo despues de la linea maximum-speed del dwc3@a800000
+            awk '
+              /^&usb3 \{/ { in_usb3=1 }
+              in_usb3 && /maximum-speed = "high-speed";/ && !done {
+                print;
+                print "\t\tdr_mode = \"peripheral\";";
+                done=1;
+                next
+              }
+              in_usb3 && /^\};/ { in_usb3=0 }
+              { print }
+            ' "$F" > "$F.new"
+            mv "$F.new" "$F"
+          fi
+
+          echo "===================== DESPUES ====================="
+          sed -n '/^&usb3 {/,/^};/p' "$F"
+
+          sed -n '/^&usb3 {/,/^};/p' "$F" | grep -q 'dr_mode = "peripheral";' \
+            || { echo "ERROR: el parche no se aplico"; exit 1; }
+          echo "OK: dr_mode = peripheral aplicado en $F"
+
       - name: Compilar Image y dtbs
         run: |
           set -e
@@ -170,6 +218,27 @@ jobs:
           grep -n -A3 'firmware/android/fstab' /tmp/fstab.dts | head -40 || { echo "ERROR: el DTB no tiene nodo fstab"; exit 1; }
           grep -q 'by-name/system' /tmp/fstab.dts || { echo "ERROR: el DTB no referencia by-name/system"; exit 1; }
           grep -q 'by-name/vendor' /tmp/fstab.dts || { echo "ERROR: el DTB no referencia by-name/vendor"; exit 1; }
+
+          echo "=== CLAVE: el DTB DEBE tener dr_mode = peripheral en ssusb@a800000 ==="
+          # Extrae el nodo ssusb@a800000 -> dwc3@a800000 y comprueba dr_mode
+          awk '/ssusb@a800000/{f=1} f{print} f&&/^\t};/{exit}' /tmp/fstab.dts > /tmp/usbnode.dts
+          echo "---- nodo ssusb@a800000 (recortado) ----"
+          head -60 /tmp/usbnode.dts
+          echo "---- dr_mode dentro de dwc3 ----"
+          awk '/dwc3@a800000/{g=1} g{print} g&&/^\t\t};/{exit}' /tmp/fstab.dts | grep -n 'dr_mode' || true
+          if awk '/dwc3@a800000/{g=1} g{print} g&&/^\t\t};/{exit}' /tmp/fstab.dts | grep -q 'dr_mode = "peripheral"'; then
+            echo "OK: dr_mode = peripheral presente en dwc3@a800000"
+          else
+            echo "ERROR: dr_mode = peripheral NO esta en el dwc3@a800000 del DTB"
+            exit 1
+          fi
+          # Y no debe quedar ningun dr_mode = "otg" en el nodo de usb3
+          if awk '/ssusb@a800000/{f=1} f{print} f&&/^\t};/{exit}' /tmp/fstab.dts | grep -q 'dr_mode = "otg"'; then
+            echo "ERROR: sigue habiendo dr_mode = otg en ssusb@a800000"
+            exit 1
+          fi
+          echo "OK: no queda dr_mode = otg en el nodo usb3"
+
           echo "=== raiz (msm-id / board-id) ==="
           grep -nE 'qcom,msm-id|qcom,board-id|compatible' /tmp/fstab.dts | head -8
 
