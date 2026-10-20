@@ -665,6 +665,66 @@ static int attach_h4(int fd)
 }
 
 /* ------------------------------------------------------------------ */
+/* Modo prueba de pulsos: probar varias combinaciones                  */
+/* ------------------------------------------------------------------ */
+
+/* El pulso se decodifica por el baudrate al que se envie. Probamos las
+ * variantes mas plausibles y vemos en cual responde el chip. */
+static int pulse_test(const char *dev)
+{
+    struct { int baud; uint8_t byte; const char *desc; } tests[] = {
+        { B115200, QCA_POWERON_PULSE,  "powerON  0xFC @115200 (sin prefijo)" },
+        { B115200, QCA_POWEROFF_PULSE, "powerOFF 0xC0 @115200" },
+        { B2400,   QCA_POWEROFF_PULSE, "powerOFF 0xC0 @2400" },
+        { B2400,   QCA_POWERON_PULSE,  "powerON  0xFC @2400" },
+        { B115200, 0x01,               "byte 0x01 @115200 (control)" },
+    };
+
+    for (size_t k = 0; k < sizeof(tests)/sizeof(tests[0]); k++) {
+        LOG("=== pulso %zu/%zu: %s ===", k+1,
+            sizeof(tests)/sizeof(tests[0]), tests[k].desc);
+        int fd = open_serial(dev);
+        if (fd < 0) return 1;
+
+        if (set_baud(fd, tests[k].baud) < 0) { close(fd); continue; }
+        set_flow_control(fd, 1);            /* como el kernel */
+        usleep(20 * 1000);
+        write_all(fd, &tests[k].byte, 1);
+        if (tcdrain(fd) < 0) ERR("tcdrain: %s", strerror(errno));
+        usleep(120 * 1000);
+
+        uint8_t buf[256];
+        ssize_t n = read(fd, buf, sizeof(buf));
+        if (n > 0) {
+            fprintf(stderr, "  -> %zd bytes:", n);
+            for (ssize_t i = 0; i < n && i < 32; i++)
+                fprintf(stderr, " %02x", buf[i]);
+            fprintf(stderr, "\n");
+        } else {
+            fprintf(stderr, "  -> (nada)\n");
+        }
+        close(fd);
+        usleep(200 * 1000);
+    }
+
+    LOG("=== fin de las pruebas de pulso ===");
+    LOG("reiniciando el chip a un estado conocido: poweroff@2400 + poweron@115200");
+    {
+        int fd = open_serial(dev);
+        if (fd >= 0) {
+            set_baud(fd, B2400); set_flow_control(fd, 1);
+            write_all(fd, (uint8_t[]){QCA_POWEROFF_PULSE}, 1); tcdrain(fd);
+            usleep(200 * 1000);
+            set_baud(fd, B115200);
+            write_all(fd, (uint8_t[]){QCA_POWERON_PULSE}, 1); tcdrain(fd);
+            usleep(200 * 1000);
+            close(fd);
+        }
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /* Modo sonda: volcar todo lo que llega del puerto                      */
 /* ------------------------------------------------------------------ */
 
@@ -787,6 +847,8 @@ int main(int argc, char **argv)
         } else if (!strcmp(argv[i], "--probe-nopulse")) {
             g_probe = 2;
             if (i + 1 < argc && argv[i+1][0] != '-') g_probe_ms = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--pulse-test")) {
+            g_probe = 3;
         } else if (!strcmp(argv[i], "-n") || !strcmp(argv[i], "--no-attach")) {
             do_attach = 0;
         } else if (!strcmp(argv[i], "-q") || !strcmp(argv[i], "--quiet")) {
@@ -810,6 +872,8 @@ int main(int argc, char **argv)
     LOG("qca-bringup: dev=%s fw=%s baud_final=%d", dev, fwdir, final_baud);
 
     /* --- Modo sonda: solo mirar que llega del chip --- */
+    if (g_probe == 3)
+        return pulse_test(dev);
     if (g_probe)
         return probe_mode(dev, g_probe == 1, g_probe_ms > 0 ? g_probe_ms : 3000);
 
